@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	golog "github.com/ipfs/go-log/v2"
 	"github.com/libp2p/go-libp2p"
@@ -22,6 +23,11 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	ma "github.com/multiformats/go-multiaddr"
 )
+
+const heartbeatProtocolID = "/heartbeat/1.0.0"
+
+// global host address
+var selfAddr string
 
 // global peer list
 var knownPeers = struct {
@@ -46,6 +52,10 @@ func addPeer(peerAddr string) bool {
 	knownPeers.Lock()
 	defer knownPeers.Unlock()
 
+	if peerAddr == selfAddr {
+		return false
+	}
+
 	if _, ok := knownPeers.list[peerAddr]; !ok {
 		knownPeers.list[peerAddr] = struct{}{}
 		fmt.Println("Known peers:")
@@ -68,6 +78,64 @@ func getPeers() []string {
 	return peers
 }
 
+func removePeer(peerAddr string) {
+	knownPeers.Lock()
+	defer knownPeers.Unlock()
+
+	if _, exists := knownPeers.list[peerAddr]; exists {
+		delete(knownPeers.list, peerAddr)
+		fmt.Println("Removed peer:", peerAddr)
+		fmt.Println("Updated peers list:")
+		for addr := range knownPeers.list {
+			fmt.Println(" - ", addr)
+		}
+	}
+}
+
+func printNumberOfPeers() {
+	knownPeers.RLock()
+	defer knownPeers.RUnlock()
+
+	numPeers := len(knownPeers.list)
+	fmt.Printf("Number of known peers: %d\n", numPeers)
+}
+
+func sendHeartbeat(ctx context.Context, ha host.Host) {
+	log.Println("Sending heartbeat")
+	peers := getPeers()
+
+	for _, pAddr := range peers {
+		if pAddr == selfAddr {
+			continue // Skip self
+		}
+
+		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
+		if err != nil {
+			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
+			continue
+		}
+
+		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+		s, err := ha.NewStream(ctx, pInfo.ID, heartbeatProtocolID)
+		if err != nil {
+			log.Printf("Heartbeat failed to %s, removing peer: %v", pInfo.ID.String(), err)
+			removePeer(pAddr) // Removing the peer if the heartbeat fails
+			continue
+		}
+
+		msg := Message{
+			Peers: getPeers(), // Include the current list of known peers in the heartbeat
+		}
+
+		if err := json.NewEncoder(s).Encode(&msg); err != nil {
+			log.Printf("Failed to send heartbeat to %s: %v", pInfo.ID.String(), err)
+		}
+		s.Close()
+	}
+
+	printNumberOfPeers()
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -82,7 +150,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Println("Host created. Multiaddress:", getHostAddress(ha))
+	selfAddr = getHostAddress(ha)
+	fmt.Println("Host created. Multiaddress:", selfAddr)
 
 	startListener(ctx, ha)
 
@@ -91,6 +160,20 @@ func main() {
 		readInput(ctx, ha)
 	}()
 
+	// Start the heartbeat goroutine
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sendHeartbeat(ctx, ha)
+			}
+		}
+	}()
 	// Wait for the context to be done.
 	<-ctx.Done()
 }
@@ -118,6 +201,24 @@ func getHostAddress(ha host.Host) string {
 }
 
 func startListener(ctx context.Context, ha host.Host) {
+	// Heartbeat message handler
+	ha.SetStreamHandler(heartbeatProtocolID, func(s network.Stream) {
+		defer s.Close()
+		var msg Message
+		if err := json.NewDecoder(s).Decode(&msg); err != nil {
+			log.Printf("Failed to decode heartbeat message: %v", err)
+			return
+		}
+		log.Println("Heartbeat received")
+
+		// Update known peers list based on the received heartbeat message
+		for _, peerAddr := range msg.Peers {
+			if addPeer(peerAddr) {
+				log.Printf("New peer from heartbeat added: %s", peerAddr)
+			}
+		}
+	})
+
 	ha.SetStreamHandler("/echo/1.0.0", func(s network.Stream) {
 		defer s.Close()
 		var msg Message
@@ -130,22 +231,19 @@ func startListener(ctx context.Context, ha host.Host) {
 		senderAddr := s.Conn().RemoteMultiaddr().String() + "/p2p/" + s.Conn().RemotePeer().String()
 
 		// Add the sender to the known peers if it's new
-		newPeerAdded := addPeer(senderAddr)
+		addPeer(senderAddr)
 
 		// Merge received peers list with known peers, and broadcast if new peers are discovered
-		newPeersDiscovered := false
-		for _, peerAddr := range msg.Peers {
-			if addPeer(peerAddr) {
-				newPeersDiscovered = true
-			}
-		}
+		// for _, peerAddr := range msg.Peers {
+		// 	addPeer(peerAddr)
+		// }
 
-		// If a new peer was discovered (either the sender or from the received peers list), broadcast the updated peers list
-		if newPeerAdded || newPeersDiscovered {
-			log.Printf("Going to broadcast")
-			broadcastPeers(ctx, ha)
-			log.Printf("Broadcast ends")
-		}
+		// // If a new peer was discovered (either the sender or from the received peers list), broadcast the updated peers list
+		// if newPeerAdded || newPeersDiscovered {
+		// 	log.Printf("Going to broadcast")
+		// 	broadcastPeers(ctx, ha)
+		// 	log.Printf("Broadcast ends")
+		// }
 
 		// Prepare and send an echo response if the message contains text
 		if msg.Text != "" {
@@ -158,35 +256,35 @@ func startListener(ctx context.Context, ha host.Host) {
 	})
 }
 
-func broadcastPeers(ctx context.Context, ha host.Host) {
-	peers := getPeers()
-	msg := Message{Peers: peers}
+// func broadcastPeers(ctx context.Context, ha host.Host) {
+// 	peers := getPeers()
+// 	msg := Message{Peers: peers}
 
-	for _, pAddr := range peers {
-		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
-		if err != nil {
-			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
-			continue
-		}
+// 	for _, pAddr := range peers {
+// 		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
+// 		if err != nil {
+// 			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
+// 			continue
+// 		}
 
-		if pInfo.ID == ha.ID() {
-			continue // Skip self
-		}
+// 		if pInfo.ID == ha.ID() {
+// 			continue // Skip self
+// 		}
 
-		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+// 		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
 
-		s, err := ha.NewStream(ctx, pInfo.ID, "/echo/1.0.0")
-		if err != nil {
-			log.Printf("Failed to open stream to %s: %v", pInfo.ID, err)
-			continue
-		}
+// 		s, err := ha.NewStream(ctx, pInfo.ID, "/echo/1.0.0")
+// 		if err != nil {
+// 			log.Printf("Failed to open stream to %s: %v", pInfo.ID, err)
+// 			continue
+// 		}
 
-		if err := json.NewEncoder(s).Encode(&msg); err != nil {
-			log.Printf("Failed to broadcast peers to %s: %v", pInfo.ID, err)
-		}
-		s.Close()
-	}
-}
+// 		if err := json.NewEncoder(s).Encode(&msg); err != nil {
+// 			log.Printf("Failed to broadcast peers to %s: %v", pInfo.ID, err)
+// 		}
+// 		s.Close()
+// 	}
+// }
 
 func readInput(ctx context.Context, ha host.Host) {
 	reader := bufio.NewReader(os.Stdin)
