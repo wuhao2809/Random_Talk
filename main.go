@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,45 @@ var knownPeers = struct {
 	list map[string]struct{}
 }{list: make(map[string]struct{})}
 
+// Message includes the text and a slice of known peer addresses
+type Message struct {
+	Text  string   `json:"text,omitempty"`
+	Peers []string `json:"peers"`
+}
+
+func isPeerKnown(peerAddr string) bool {
+	knownPeers.RLock()
+	defer knownPeers.RUnlock()
+	_, exists := knownPeers.list[peerAddr]
+	return exists
+}
+
+func addPeer(peerAddr string) bool {
+	knownPeers.Lock()
+	defer knownPeers.Unlock()
+
+	if _, ok := knownPeers.list[peerAddr]; !ok {
+		knownPeers.list[peerAddr] = struct{}{}
+		fmt.Println("Known peers:")
+		for addr := range knownPeers.list {
+			fmt.Printf(" - %s\n", addr)
+		}
+		return true // New peer added
+	}
+	return false // Peer was already known
+}
+
+func getPeers() []string {
+	knownPeers.RLock()
+	defer knownPeers.RUnlock()
+
+	peers := make([]string, 0, len(knownPeers.list))
+	for addr := range knownPeers.list {
+		peers = append(peers, addr)
+	}
+	return peers
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -42,16 +82,21 @@ func main() {
 		log.Fatal(err)
 	}
 
+	fmt.Println("Host created. Multiaddress:", getHostAddress(ha))
+
 	startListener(ctx, ha)
 
-	go readInput(ctx, ha)
+	// Separate goroutine for reading input and handling user commands
+	go func() {
+		readInput(ctx, ha)
+	}()
 
+	// Wait for the context to be done.
 	<-ctx.Done()
 }
 
 func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, error) {
-	var r io.Reader
-	r = rand.Reader
+	var r io.Reader = rand.Reader
 
 	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
 	if err != nil {
@@ -67,45 +112,80 @@ func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, er
 }
 
 func getHostAddress(ha host.Host) string {
-	// Build host multiaddress
 	hostAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", ha.ID()))
-
-	// Now we can build a full multiaddress to reach this host
-	// by encapsulating both addresses:
 	addr := ha.Addrs()[0]
 	return addr.Encapsulate(hostAddr).String()
 }
 
 func startListener(ctx context.Context, ha host.Host) {
-	fullAddr := getHostAddress(ha)
-	log.Printf("I am %s\n", fullAddr)
-
 	ha.SetStreamHandler("/echo/1.0.0", func(s network.Stream) {
-		log.Println("Received new stream")
-		go func() {
-			defer s.Close()
-			if err := doEcho(s); err != nil {
-				log.Println("Error handling echo:", err)
-				s.Reset()
+		defer s.Close()
+		var msg Message
+		if err := json.NewDecoder(s).Decode(&msg); err != nil {
+			log.Printf("Failed to decode message: %v", err)
+			return
+		}
+
+		// Extract the sender's full multiaddress
+		senderAddr := s.Conn().RemoteMultiaddr().String() + "/p2p/" + s.Conn().RemotePeer().String()
+
+		// Add the sender to the known peers if it's new
+		newPeerAdded := addPeer(senderAddr)
+
+		// Merge received peers list with known peers, and broadcast if new peers are discovered
+		newPeersDiscovered := false
+		for _, peerAddr := range msg.Peers {
+			if addPeer(peerAddr) {
+				newPeersDiscovered = true
 			}
-		}()
+		}
+
+		// If a new peer was discovered (either the sender or from the received peers list), broadcast the updated peers list
+		if newPeerAdded || newPeersDiscovered {
+			log.Printf("Going to broadcast")
+			broadcastPeers(ctx, ha)
+			log.Printf("Broadcast ends")
+		}
+
+		// Prepare and send an echo response if the message contains text
+		if msg.Text != "" {
+			log.Printf("Message received from %s: %s", senderAddr, msg.Text)
+			response := Message{Text: "Echo: " + msg.Text, Peers: getPeers()}
+			if err := json.NewEncoder(s).Encode(&response); err != nil {
+				log.Printf("Failed to send echo response: %v", err)
+			}
+		}
 	})
 }
 
-func doEcho(s network.Stream) error {
-	buf := bufio.NewReader(s)
-	str, err := buf.ReadString('\n')
-	if err != nil {
-		return err
+func broadcastPeers(ctx context.Context, ha host.Host) {
+	peers := getPeers()
+	msg := Message{Peers: peers}
+
+	for _, pAddr := range peers {
+		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
+		if err != nil {
+			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
+			continue
+		}
+
+		if pInfo.ID == ha.ID() {
+			continue // Skip self
+		}
+
+		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+
+		s, err := ha.NewStream(ctx, pInfo.ID, "/echo/1.0.0")
+		if err != nil {
+			log.Printf("Failed to open stream to %s: %v", pInfo.ID, err)
+			continue
+		}
+
+		if err := json.NewEncoder(s).Encode(&msg); err != nil {
+			log.Printf("Failed to broadcast peers to %s: %v", pInfo.ID, err)
+		}
+		s.Close()
 	}
-
-	// Add the peer to the known peers list
-	remotePeer := s.Conn().RemoteMultiaddr().String() + "/p2p/" + s.Conn().RemotePeer().String()
-	addPeer(remotePeer)
-
-	log.Printf("Echoing back: %s", str)
-	_, err = s.Write([]byte(str))
-	return err
 }
 
 func readInput(ctx context.Context, ha host.Host) {
@@ -114,7 +194,7 @@ func readInput(ctx context.Context, ha host.Host) {
 		fmt.Print("Enter the multiaddress of the peer to send an echo message to: ")
 		addrStr, err := reader.ReadString('\n')
 		if err != nil {
-			log.Println("Error reading input:", err)
+			log.Printf("Error reading input: %v", err)
 			continue
 		}
 		addrStr = strings.TrimSpace(addrStr)
@@ -122,57 +202,39 @@ func readInput(ctx context.Context, ha host.Host) {
 			continue
 		}
 
-		err = sendEcho(ctx, ha, addrStr)
-		if err != nil {
-			log.Println("Error sending echo:", err)
-		}
+		// Directly send the echo without waiting for user text input
+		sendEcho(ctx, ha, addrStr, "Hello, world!")
 	}
 }
 
-func sendEcho(ctx context.Context, ha host.Host, addrStr string) error {
+func sendEcho(ctx context.Context, ha host.Host, addrStr, text string) {
 	addr, err := ma.NewMultiaddr(addrStr)
 	if err != nil {
-		return err
+		log.Printf("Error parsing multiaddr: %v", err)
+		return
 	}
 
 	info, err := peer.AddrInfoFromP2pAddr(addr)
 	if err != nil {
-		return err
+		log.Printf("Error extracting peer info: %v", err)
+		return
 	}
 
 	ha.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
 	s, err := ha.NewStream(ctx, info.ID, "/echo/1.0.0")
 	if err != nil {
-		return err
+		log.Printf("Error opening stream: %v", err)
+		return
 	}
 	defer s.Close()
 
-	log.Println("Sending echo to:", info.ID)
-	_, err = s.Write([]byte("Hello, world!\n"))
-	if err != nil {
-		return err
+	msg := Message{Text: text}
+	if err := json.NewEncoder(s).Encode(&msg); err != nil {
+		log.Printf("Error sending message: %v", err)
 	}
-
-	out, err := io.ReadAll(s)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Received echo reply: %q\n", out)
 
 	// Add the peer to the known peers list
-	addPeer(addrStr)
-	return nil
-}
-
-// Add a peer to the global known peers list and print the list
-func addPeer(peerAddr string) {
-	knownPeers.Lock()
-	defer knownPeers.Unlock()
-
-	knownPeers.list[peerAddr] = struct{}{}
-	log.Println("Known peers:")
-	for addr := range knownPeers.list {
-		log.Printf(" - %s\n", addr)
+	if !isPeerKnown(addrStr) {
+		addPeer(addrStr)
 	}
 }
