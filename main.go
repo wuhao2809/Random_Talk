@@ -7,133 +7,42 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	golog "github.com/ipfs/go-log/v2"
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/peerstore"
-	ma "github.com/multiformats/go-multiaddr"
+	libp2p "github.com/libp2p/go-libp2p"
+	crypto "github.com/libp2p/go-libp2p/core/crypto"
+	host "github.com/libp2p/go-libp2p/core/host"
+	network "github.com/libp2p/go-libp2p/core/network"
+	peer "github.com/libp2p/go-libp2p/core/peer"
+	peerstore "github.com/libp2p/go-libp2p/core/peerstore"
+	multiaddr "github.com/multiformats/go-multiaddr"
 )
 
-const heartbeatProtocolID = "/heartbeat/1.0.0"
+const echoProtocolID = "/echo/1.0.0"
 
-// global host address
+var selfHost host.Host
 var selfAddr string
 
-// global peer list
 var knownPeers = struct {
 	sync.RWMutex
 	list map[string]struct{}
 }{list: make(map[string]struct{})}
 
-// Message includes the text and a slice of known peer addresses
+var seenMessages = struct {
+	sync.RWMutex
+	ids map[string]struct{}
+}{ids: make(map[string]struct{})}
+
 type Message struct {
+	ID    string   `json:"id"`
 	Text  string   `json:"text,omitempty"`
-	Peers []string `json:"peers"`
-}
-
-func isPeerKnown(peerAddr string) bool {
-	knownPeers.RLock()
-	defer knownPeers.RUnlock()
-	_, exists := knownPeers.list[peerAddr]
-	return exists
-}
-
-func addPeer(peerAddr string) bool {
-	knownPeers.Lock()
-	defer knownPeers.Unlock()
-
-	if peerAddr == selfAddr {
-		return false
-	}
-
-	if _, ok := knownPeers.list[peerAddr]; !ok {
-		knownPeers.list[peerAddr] = struct{}{}
-		fmt.Println("Known peers:")
-		for addr := range knownPeers.list {
-			fmt.Printf(" - %s\n", addr)
-		}
-		return true // New peer added
-	}
-	return false // Peer was already known
-}
-
-func getPeers() []string {
-	knownPeers.RLock()
-	defer knownPeers.RUnlock()
-
-	peers := make([]string, 0, len(knownPeers.list))
-	for addr := range knownPeers.list {
-		peers = append(peers, addr)
-	}
-	return peers
-}
-
-func removePeer(peerAddr string) {
-	knownPeers.Lock()
-	defer knownPeers.Unlock()
-
-	if _, exists := knownPeers.list[peerAddr]; exists {
-		delete(knownPeers.list, peerAddr)
-		fmt.Println("Removed peer:", peerAddr)
-		fmt.Println("Updated peers list:")
-		for addr := range knownPeers.list {
-			fmt.Println(" - ", addr)
-		}
-	}
-}
-
-func printNumberOfPeers() {
-	knownPeers.RLock()
-	defer knownPeers.RUnlock()
-
-	numPeers := len(knownPeers.list)
-	fmt.Printf("Number of known peers: %d\n", numPeers)
-}
-
-func sendHeartbeat(ctx context.Context, ha host.Host) {
-	log.Println("Sending heartbeat")
-	peers := getPeers()
-
-	for _, pAddr := range peers {
-		if pAddr == selfAddr {
-			continue // Skip self
-		}
-
-		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
-		if err != nil {
-			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
-			continue
-		}
-
-		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
-		s, err := ha.NewStream(ctx, pInfo.ID, heartbeatProtocolID)
-		if err != nil {
-			log.Printf("Heartbeat failed to %s, removing peer: %v", pInfo.ID.String(), err)
-			removePeer(pAddr) // Removing the peer if the heartbeat fails
-			continue
-		}
-
-		msg := Message{
-			Peers: getPeers(), // Include the current list of known peers in the heartbeat
-		}
-
-		if err := json.NewEncoder(s).Encode(&msg); err != nil {
-			log.Printf("Failed to send heartbeat to %s: %v", pInfo.ID.String(), err)
-		}
-		s.Close()
-	}
-
-	printNumberOfPeers()
+	Peers []string `json:"peers,omitempty"`
 }
 
 func main() {
@@ -142,46 +51,42 @@ func main() {
 
 	golog.SetAllLoggers(golog.LevelInfo)
 
-	listenF := flag.Int("l", 4001, "wait for incoming connections")
+	listenFlag := flag.Int("l", 0, "Port on which the node will listen")
 	flag.Parse()
 
-	ha, err := makeBasicHost(*listenF, false, 0)
+	if *listenFlag == 0 {
+		log.Fatal("Please provide a port to bind on with -l")
+	}
+
+	var err error
+	selfHost, err = makeBasicHost(*listenFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
+	selfAddr = getHostAddress(selfHost)
 
-	selfAddr = getHostAddress(ha)
-	fmt.Println("Host created. Multiaddress:", selfAddr)
+	fmt.Println("This node's multiaddress:", selfAddr)
+	addPeer(selfAddr) // Add self to known peers
 
-	startListener(ctx, ha)
+	startListener(ctx)
 
-	// Separate goroutine for reading input and handling user commands
-	go func() {
-		readInput(ctx, ha)
-	}()
+	go readInput(ctx)
 
-	// Start the heartbeat goroutine
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				sendHeartbeat(ctx, ha)
-			}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			broadcastHeartbeat(ctx)
 		}
-	}()
-	// Wait for the context to be done.
-	<-ctx.Done()
+	}
 }
 
-func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, error) {
-	var r io.Reader = rand.Reader
-
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
+func makeBasicHost(listenPort int) (host.Host, error) {
+	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 	if err != nil {
 		return nil, err
 	}
@@ -194,145 +99,194 @@ func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, er
 	return libp2p.New(opts...)
 }
 
-func getHostAddress(ha host.Host) string {
-	hostAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", ha.ID()))
-	addr := ha.Addrs()[0]
+func getHostAddress(h host.Host) string {
+	hostAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s", h.ID().String()))
+	addr := h.Addrs()[0]
 	return addr.Encapsulate(hostAddr).String()
 }
 
-func startListener(ctx context.Context, ha host.Host) {
-	// Heartbeat message handler
-	ha.SetStreamHandler(heartbeatProtocolID, func(s network.Stream) {
+func startListener(ctx context.Context) {
+	selfHost.SetStreamHandler(echoProtocolID, func(s network.Stream) {
 		defer s.Close()
+
 		var msg Message
 		if err := json.NewDecoder(s).Decode(&msg); err != nil {
-			log.Printf("Failed to decode heartbeat message: %v", err)
-			return
-		}
-		log.Println("Heartbeat received")
-
-		// Update known peers list based on the received heartbeat message
-		for _, peerAddr := range msg.Peers {
-			if addPeer(peerAddr) {
-				log.Printf("New peer from heartbeat added: %s", peerAddr)
-			}
-		}
-	})
-
-	ha.SetStreamHandler("/echo/1.0.0", func(s network.Stream) {
-		defer s.Close()
-		var msg Message
-		if err := json.NewDecoder(s).Decode(&msg); err != nil {
-			log.Printf("Failed to decode message: %v", err)
+			log.Println("Failed to decode message:", err)
 			return
 		}
 
-		// Extract the sender's full multiaddress
-		senderAddr := s.Conn().RemoteMultiaddr().String() + "/p2p/" + s.Conn().RemotePeer().String()
-
-		// Add the sender to the known peers if it's new
-		addPeer(senderAddr)
-
-		// Merge received peers list with known peers, and broadcast if new peers are discovered
-		// for _, peerAddr := range msg.Peers {
-		// 	addPeer(peerAddr)
-		// }
-
-		// // If a new peer was discovered (either the sender or from the received peers list), broadcast the updated peers list
-		// if newPeerAdded || newPeersDiscovered {
-		// 	log.Printf("Going to broadcast")
-		// 	broadcastPeers(ctx, ha)
-		// 	log.Printf("Broadcast ends")
-		// }
-
-		// Prepare and send an echo response if the message contains text
-		if msg.Text != "" {
-			log.Printf("Message received from %s: %s", senderAddr, msg.Text)
-			response := Message{Text: "Echo: " + msg.Text, Peers: getPeers()}
-			if err := json.NewEncoder(s).Encode(&response); err != nil {
-				log.Printf("Failed to send echo response: %v", err)
-			}
-		}
+		handleMessage(s, msg)
 	})
 }
 
-// func broadcastPeers(ctx context.Context, ha host.Host) {
-// 	peers := getPeers()
-// 	msg := Message{Peers: peers}
+// Helper function to extract the sender's full multiaddress from the stream
+func getFullAddressFromStream(s network.Stream) string {
+	remotePeer := s.Conn().RemotePeer().String()
+	remoteAddr := s.Conn().RemoteMultiaddr().String()
+	return fmt.Sprintf("%s/p2p/%s", remoteAddr, remotePeer)
+}
 
-// 	for _, pAddr := range peers {
-// 		pInfo, err := peer.AddrInfoFromP2pAddr(ma.StringCast(pAddr))
-// 		if err != nil {
-// 			log.Printf("Failed to get AddrInfo from P2pAddr: %v", err)
-// 			continue
-// 		}
+func handleMessage(s network.Stream, msg Message) {
+	// Extract the sender's full multiaddress
+	senderAddr := getFullAddressFromStream(s)
+	addPeer(senderAddr)
 
-// 		if pInfo.ID == ha.ID() {
-// 			continue // Skip self
-// 		}
+	// If this is a heartbeat message, update peers and return without rebroadcasting
+	if msg.Text == "Heartbeat" {
+		for _, p := range msg.Peers {
+			addPeer(p)
+		}
+		return // Do not rebroadcast heartbeat messages
+	}
 
-// 		ha.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+	// For non-heartbeat messages, check if we've seen this message before
+	seenMessages.Lock()
+	if _, seen := seenMessages.ids[msg.ID]; seen {
+		seenMessages.Unlock()
+		return // If message has been seen, do nothing
+	}
+	// Mark this message as seen
+	seenMessages.ids[msg.ID] = struct{}{}
+	seenMessages.Unlock()
 
-// 		s, err := ha.NewStream(ctx, pInfo.ID, "/echo/1.0.0")
-// 		if err != nil {
-// 			log.Printf("Failed to open stream to %s: %v", pInfo.ID, err)
-// 			continue
-// 		}
+	// Proceed to log the message and rebroadcast if it's not a heartbeat
+	if msg.Text != "" {
+		fmt.Printf("Message from %s: %s\n", s.Conn().RemotePeer(), msg.Text)
+		// Rebroadcast message to other peers
+		broadcastMessage(msg)
+	}
+}
 
-// 		if err := json.NewEncoder(s).Encode(&msg); err != nil {
-// 			log.Printf("Failed to broadcast peers to %s: %v", pInfo.ID, err)
-// 		}
-// 		s.Close()
-// 	}
-// }
+func broadcastMessage(msg Message) {
+	peers := getPeers()
+	for _, pAddr := range peers {
+		pInfo, err := peer.AddrInfoFromP2pAddr(multiaddr.StringCast(pAddr))
+		if err != nil {
+			log.Println("Failed to parse multiaddr:", err)
+			continue
+		}
 
-func readInput(ctx context.Context, ha host.Host) {
+		if pInfo.ID == selfHost.ID() {
+			continue
+		}
+
+		selfHost.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+		s, err := selfHost.NewStream(context.Background(), pInfo.ID, echoProtocolID)
+		if err != nil {
+			log.Println("Failed to open stream:", err)
+			continue
+		}
+		defer s.Close()
+
+		if err := json.NewEncoder(s).Encode(&msg); err != nil {
+			log.Println("Failed to send message:", err)
+		}
+	}
+}
+
+func printNumberOfPeers() {
+	knownPeers.RLock()
+	defer knownPeers.RUnlock()
+
+	numPeers := len(knownPeers.list)
+	fmt.Printf("Number of known peers: %d\n", numPeers)
+}
+
+func broadcastHeartbeat(ctx context.Context) {
+	// log.Printf("Sending heartBeat")
+	peers := getPeers()
+	msg := Message{
+		ID:    uuid.New().String(),
+		Text:  "Heartbeat",
+		Peers: peers,
+	}
+
+	for _, pAddr := range peers {
+		if pAddr == selfAddr {
+			continue
+		}
+
+		pInfo, err := peer.AddrInfoFromP2pAddr(multiaddr.StringCast(pAddr))
+		if err != nil {
+			log.Println("Failed to parse multiaddr:", err)
+			continue
+		}
+
+		selfHost.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
+		s, err := selfHost.NewStream(ctx, pInfo.ID, echoProtocolID)
+		if err != nil {
+			log.Printf("Heartbeat failed to %s, removing peer: %s\n", pInfo.ID.String(), pAddr)
+			removePeer(pAddr)
+			continue
+		}
+		defer s.Close()
+
+		if err := json.NewEncoder(s).Encode(&msg); err != nil {
+			log.Printf("Failed to send heartbeat to %s: %s\n", pInfo.ID.String(), pAddr)
+		}
+	}
+	// printNumberOfPeers()
+}
+
+func readInput(ctx context.Context) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter the multiaddress of the peer to send an echo message to: ")
-		addrStr, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("Error reading input: %v", err)
-			continue
-		}
-		addrStr = strings.TrimSpace(addrStr)
-		if addrStr == "" {
-			continue
+		fmt.Print("Enter a message or multiaddress (or 'exit' to quit): \n")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		if input == "exit" {
+			return
 		}
 
-		// Directly send the echo without waiting for user text input
-		sendEcho(ctx, ha, addrStr, "Hello, world!")
+		// Check if input is a multiaddress
+		if ma, err := multiaddr.NewMultiaddr(input); err == nil {
+			peerInfo, err := peer.AddrInfoFromP2pAddr(ma)
+			if err != nil {
+				fmt.Println("Error extracting peer info:", err)
+				continue
+			}
+			selfHost.Connect(ctx, *peerInfo)
+			addPeer(input)
+			fmt.Println("Connected to:", input)
+		} else if input == "peers" {
+			printNumberOfPeers()
+		} else { // Broadcast input as a message
+			msg := Message{
+				ID:   uuid.New().String(),
+				Text: input,
+			}
+			broadcastMessage(msg)
+		}
 	}
 }
 
-func sendEcho(ctx context.Context, ha host.Host, addrStr, text string) {
-	addr, err := ma.NewMultiaddr(addrStr)
-	if err != nil {
-		log.Printf("Error parsing multiaddr: %v", err)
-		return
-	}
+func addPeer(peerAddr string) bool {
+	knownPeers.Lock()
+	defer knownPeers.Unlock()
 
-	info, err := peer.AddrInfoFromP2pAddr(addr)
-	if err != nil {
-		log.Printf("Error extracting peer info: %v", err)
-		return
+	if _, exists := knownPeers.list[peerAddr]; !exists && peerAddr != selfAddr {
+		knownPeers.list[peerAddr] = struct{}{}
+		return true
 	}
+	return false
+}
 
-	ha.Peerstore().AddAddrs(info.ID, info.Addrs, peerstore.PermanentAddrTTL)
-	s, err := ha.NewStream(ctx, info.ID, "/echo/1.0.0")
-	if err != nil {
-		log.Printf("Error opening stream: %v", err)
-		return
+func removePeer(peerAddr string) {
+	knownPeers.Lock()
+	defer knownPeers.Unlock()
+	if _, exists := knownPeers.list[peerAddr]; exists {
+		delete(knownPeers.list, peerAddr)
 	}
-	defer s.Close()
+}
 
-	msg := Message{Text: text}
-	if err := json.NewEncoder(s).Encode(&msg); err != nil {
-		log.Printf("Error sending message: %v", err)
-	}
+func getPeers() []string {
+	knownPeers.RLock()
+	defer knownPeers.RUnlock()
 
-	// Add the peer to the known peers list
-	if !isPeerKnown(addrStr) {
-		addPeer(addrStr)
+	var peers []string
+	for p := range knownPeers.list {
+		peers = append(peers, p)
 	}
+	return peers
 }
