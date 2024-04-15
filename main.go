@@ -40,9 +40,10 @@ var seenMessages = struct {
 }{ids: make(map[string]struct{})}
 
 type Message struct {
-	ID    string   `json:"id"`
-	Text  string   `json:"text,omitempty"`
-	Peers []string `json:"peers,omitempty"`
+	ID        string   `json:"id"`
+	Text      string   `json:"text,omitempty"`
+	Peers     []string `json:"peers,omitempty"`
+	Timestamp int64    `json:"timestamp"` // Unix timestamp in milliseconds
 }
 
 func main() {
@@ -51,6 +52,7 @@ func main() {
 
 	golog.SetAllLoggers(golog.LevelInfo)
 
+	publicIP := flag.String("public-ip", "", "The public IP address or DNS name of the node")
 	listenFlag := flag.Int("l", 0, "Port on which the node will listen")
 	flag.Parse()
 
@@ -63,7 +65,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	selfAddr = getHostAddress(selfHost)
+	selfAddr = getHostAddress(selfHost, *publicIP, *listenFlag)
 
 	fmt.Println("This node's multiaddress:", selfAddr)
 	addPeer(selfAddr) // Add self to known peers
@@ -99,7 +101,12 @@ func makeBasicHost(listenPort int) (host.Host, error) {
 	return libp2p.New(opts...)
 }
 
-func getHostAddress(h host.Host) string {
+func getHostAddress(h host.Host, publicIP string, listenPort int) string {
+	// If a public IP or DNS name is provided, use it
+	if publicIP != "" {
+		return fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", publicIP, listenPort, h.ID().String())
+	}
+
 	hostAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/p2p/%s", h.ID().String()))
 	addr := h.Addrs()[0]
 	return addr.Encapsulate(hostAddr).String()
@@ -151,13 +158,15 @@ func handleMessage(s network.Stream, msg Message) {
 
 	// Proceed to log the message and rebroadcast if it's not a heartbeat
 	if msg.Text != "" {
-		fmt.Printf("Message from %s: %s\n", s.Conn().RemotePeer(), msg.Text)
+		delay := time.Now().UnixNano()/1e6 - msg.Timestamp
+		fmt.Printf("Message from %s received with %d ms delay: %s\n", s.Conn().RemotePeer(), delay, msg.Text)
 		// Rebroadcast message to other peers
 		broadcastMessage(msg)
 	}
 }
 
 func broadcastMessage(msg Message) {
+	msg.Timestamp = time.Now().UnixNano() / 1e6
 	peers := getPeers()
 	for _, pAddr := range peers {
 		pInfo, err := peer.AddrInfoFromP2pAddr(multiaddr.StringCast(pAddr))
@@ -173,7 +182,7 @@ func broadcastMessage(msg Message) {
 		selfHost.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
 		s, err := selfHost.NewStream(context.Background(), pInfo.ID, echoProtocolID)
 		if err != nil {
-			log.Println("Failed to open stream:", err)
+			// log.Println("Failed to open stream:", err)
 			continue
 		}
 		defer s.Close()
@@ -215,7 +224,7 @@ func broadcastHeartbeat(ctx context.Context) {
 		selfHost.Peerstore().AddAddrs(pInfo.ID, pInfo.Addrs, peerstore.PermanentAddrTTL)
 		s, err := selfHost.NewStream(ctx, pInfo.ID, echoProtocolID)
 		if err != nil {
-			log.Printf("Heartbeat failed to %s, removing peer: %s\n", pInfo.ID.String(), pAddr)
+			// log.Printf("Heartbeat failed to %s, removing peer: %s\n", pInfo.ID.String(), pAddr)
 			removePeer(pAddr)
 			continue
 		}
